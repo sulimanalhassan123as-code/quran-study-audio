@@ -1,0 +1,94 @@
+name: Content Guard
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    name: Content Guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Every JSON file parses
+        run: |
+          fail=0
+          bad=""
+          while IFS= read -r f; do
+            python3 -c "import json,sys;json.load(open(sys.argv[1],encoding='utf-8'))" "$f" 2>/dev/null || { bad="$bad$f\n"; fail=1; }
+          done < <(git ls-files '*.json')
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::Malformed JSON breaks the app. Files:"
+            printf "$bad"
+            exit 1
+          fi
+          echo "PASS - all JSON files parse ($(git ls-files '*.json' | wc -l) files)"
+
+      - name: No credential patterns
+        run: |
+          hits=$(git ls-files | grep -vE '\.(mp3|wav|ogg|png|jpg|jpeg|webp|zip)$' | while read -r f; do
+            grep -nEI 'AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{60,}|sk-[A-Za-z0-9]{32,}|xox[baprs]-[A-Za-z0-9-]{10,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}' "$f" 2>/dev/null | sed "s|^|$f:|"
+          done || true)
+          if [ -n "$hits" ]; then
+            echo "::error::Credential patterns found:"
+            echo "$hits"
+            exit 1
+          fi
+          echo "PASS - no credential patterns"
+
+      - name: No remote-execution or obfuscation
+        run: |
+          bad=$(git ls-files | grep -vE '\.(mp3|wav|ogg|png|jpg|jpeg|webp|zip)$' | while read -r f; do
+            grep -nEI 'eval\(atob|eval\(unescape|curl[^|]*\|[[:space:]]*(ba)?sh|wget[^|]*\|[[:space:]]*(ba)?sh|child_process\.(exec|spawn)|new Function\(' "$f" 2>/dev/null | sed "s|^|$f:|"
+          done || true)
+          if [ -n "$bad" ]; then
+            echo "::error::Dangerous construct found:"
+            echo "$bad"
+            exit 1
+          fi
+          echo "PASS - no remote-execution patterns"
+
+      - name: No oversized or forbidden files in this change
+        run: |
+          LIMIT=$((50*1024*1024))
+          fail=0
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE="origin/${{ github.base_ref }}"
+            git fetch --no-tags --depth=1 origin "${{ github.base_ref }}" || true
+            CHANGED=$(git diff --name-only "$BASE"...HEAD 2>/dev/null || git diff --name-only HEAD~1 HEAD)
+          else
+            CHANGED=$(git diff --name-only HEAD~1 HEAD 2>/dev/null || echo "")
+          fi
+          for f in $CHANGED; do
+            [ -f "$f" ] || continue
+            case "$f" in
+              *.exe|*.dll|*.so|*.bat|*.cmd|*.hta|*.vbs|*.jar|*.apk)
+                echo "::error::Forbidden binary type: $f"; fail=1;;
+            esac
+            sz=$(stat -c%s "$f")
+            if [ "$sz" -gt "$LIMIT" ]; then
+              echo "::error::$f is $((sz/1024/1024))MB, over the 50MB per-file limit"; fail=1
+            fi
+          done
+          [ "$fail" -eq 0 ] && echo "PASS - changed files within limits"
+          exit $fail
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "### Content Guard" >> "$GITHUB_STEP_SUMMARY"
+          echo "- commit: ${{ github.sha }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- JSON files: $(git ls-files '*.json' | wc -l)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- audio files: $(git ls-files '*.mp3' | wc -l)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- tree size: $(du -sh --exclude=.git . 2>/dev/null | cut -f1)" >> "$GITHUB_STEP_SUMMARY"
